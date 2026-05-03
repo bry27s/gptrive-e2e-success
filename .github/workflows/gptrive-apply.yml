@@ -1,0 +1,394 @@
+name: GPTrive Apply
+
+on:
+  push:
+    paths:
+      - ".gptrive/patches/*.ready.json"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout trigger commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Resolve ready marker
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(git show --name-only --pretty='' "$GITHUB_SHA" -- .gptrive/patches || true)"
+          ready_path="$(printf '%s\n' "$changed_files" | grep -E '^\.gptrive/patches/.*\.ready\.json$' | tail -n1 || true)"
+
+          if [ -z "$ready_path" ]; then
+            ready_path="$(find .gptrive/patches -maxdepth 1 -type f -name '*.ready.json' | sort | tail -n1 || true)"
+          fi
+
+          if [ -z "$ready_path" ]; then
+            echo "No ready marker found."
+            exit 1
+          fi
+
+          echo "ready_path=${ready_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Read ready marker
+        id: ready
+        env:
+          READY_PATH: ${{ steps.resolve.outputs.ready_path }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const readyPath = process.env.READY_PATH;
+          const outputPath = process.env.GITHUB_OUTPUT;
+          const ready = JSON.parse(fs.readFileSync(readyPath, "utf8"));
+
+          function assertPatchPath(value, label) {
+            if (!value || typeof value !== "string") {
+              throw new Error(`${label} missing.`);
+            }
+
+            const normalized = value.replace(/\\/g, "/");
+
+            if (!normalized.startsWith(".gptrive/patches/")) {
+              throw new Error(`${label} must stay inside .gptrive/patches/: ${value}`);
+            }
+
+            if (normalized.includes("..") || normalized.includes("/.git") || normalized.startsWith("/")) {
+              throw new Error(`${label} unsafe: ${value}`);
+            }
+
+            return normalized;
+          }
+
+          if (!ready.id || typeof ready.id !== "string") {
+            throw new Error("ready.json missing id");
+          }
+
+          const zipPath = assertPatchPath(ready.zipPath, "zipPath");
+          const metaPath = assertPatchPath(ready.metaPath, "metaPath");
+          const normalizedReadyPath = assertPatchPath(readyPath, "readyPath");
+
+          if (!fs.existsSync(zipPath)) {
+            throw new Error(`zip file missing: ${zipPath}`);
+          }
+
+          if (!fs.existsSync(metaPath)) {
+            throw new Error(`meta file missing: ${metaPath}`);
+          }
+
+          const lines = [
+            `patch_id=${ready.id}`,
+            `zip_path=${zipPath}`,
+            `meta_path=${metaPath}`,
+            `ready_path=${normalizedReadyPath}`
+          ];
+
+          fs.appendFileSync(outputPath, `${lines.join("\n")}\n`);
+          NODE
+
+      - name: Read patch metadata
+        id: meta
+        env:
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+
+          const metaPath = process.env.META_PATH;
+          const outputPath = process.env.GITHUB_OUTPUT;
+          const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+          const applyMode = meta.applyMode;
+          const targetBranch = meta.targetBranch;
+
+          if (!["direct-branch", "direct-main"].includes(applyMode)) {
+            throw new Error(`Unsupported applyMode: ${applyMode}`);
+          }
+
+          if (!targetBranch || typeof targetBranch !== "string") {
+            throw new Error("targetBranch missing in meta.json");
+          }
+
+          const checkoutBranch = applyMode === "direct-main" ? "main" : targetBranch;
+          const lines = [
+            `apply_mode=${applyMode}`,
+            `target_branch=${targetBranch}`,
+            `checkout_branch=${checkoutBranch}`
+          ];
+
+          fs.appendFileSync(outputPath, `${lines.join("\n")}\n`);
+          NODE
+
+      - name: Validate branch protocol
+        env:
+          EVENT_BRANCH: ${{ github.ref_name }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CHECKOUT_BRANCH" != "$EVENT_BRANCH" ]; then
+            echo "Push branch: $EVENT_BRANCH"
+            echo "Expected branch: $CHECKOUT_BRANCH"
+            exit 1
+          fi
+
+          if [ "$APPLY_MODE" = "direct-main" ] && [ "$EVENT_BRANCH" != "main" ]; then
+            echo "direct-main must upload on main."
+            exit 1
+          fi
+
+          if [ "$APPLY_MODE" = "direct-branch" ] && [ "$TARGET_BRANCH" != "$EVENT_BRANCH" ]; then
+            echo "direct-branch must upload on targetBranch."
+            exit 1
+          fi
+
+      - name: Prepare apply branch
+        env:
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$CHECKOUT_BRANCH" --depth=1
+          git checkout -B "$CHECKOUT_BRANCH" "origin/$CHECKOUT_BRANCH"
+
+      - name: Log workflow branch state
+        env:
+          EVENT_BRANCH: ${{ github.ref_name }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+        run: |
+          set -euo pipefail
+          echo "github.ref_name=$EVENT_BRANCH"
+          echo "targetBranch=$TARGET_BRANCH"
+          echo "applyMode=$APPLY_MODE"
+          echo "current git branch=$(git branch --show-current)"
+          echo "current git sha=$(git rev-parse HEAD)"
+
+      - name: Stage patch files
+        env:
+          ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          READY_PATH: ${{ steps.resolve.outputs.ready_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gptrive-patch"
+          cp "$ZIP_PATH" "$RUNNER_TEMP/gptrive-patch/patch.zip"
+          cp "$META_PATH" "$RUNNER_TEMP/gptrive-patch/meta.json"
+          cp "$READY_PATH" "$RUNNER_TEMP/gptrive-patch/ready.json"
+
+      - name: Validate zip entry paths
+        run: |
+          set -euo pipefail
+          unzip -Z1 "$RUNNER_TEMP/gptrive-patch/patch.zip" > "$RUNNER_TEMP/gptrive-patch/entries.txt"
+          node <<'NODE'
+          const fs = require("fs");
+
+          const entries = fs
+            .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-patch/entries.txt`, "utf8")
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+
+          function assertSafeArchivePath(entry) {
+            if (entry.startsWith("/") || /^[A-Za-z]:[\\/]/.test(entry)) {
+              throw new Error(`Absolute path not allowed: ${entry}`);
+            }
+
+            const segments = entry.split("/").filter(Boolean);
+
+            if (segments.includes("..")) {
+              throw new Error(`Parent traversal not allowed: ${entry}`);
+            }
+
+            if (segments.includes(".git")) {
+              throw new Error(`.git path not allowed: ${entry}`);
+            }
+          }
+
+          for (const entry of entries) {
+            assertSafeArchivePath(entry);
+          }
+          NODE
+
+      - name: Extract patch
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gptrive-extract"
+          unzip -q "$RUNNER_TEMP/gptrive-patch/patch.zip" -d "$RUNNER_TEMP/gptrive-extract"
+
+      - name: Apply files and deletes
+        env:
+          EXTRACT_ROOT: ${{ runner.temp }}/gptrive-extract
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const repoRoot = process.cwd();
+          const extractRoot = process.env.EXTRACT_ROOT;
+          const filesRoot = path.join(extractRoot, "files");
+          const deletesPath = path.join(extractRoot, "deletes.txt");
+
+          function assertSafeRelativePath(relativePath) {
+            if (!relativePath || typeof relativePath !== "string") {
+              throw new Error("Path empty.");
+            }
+
+            if (path.isAbsolute(relativePath) || /^[A-Za-z]:[\\/]/.test(relativePath)) {
+              throw new Error(`Absolute path not allowed: ${relativePath}`);
+            }
+
+            const normalized = relativePath.replace(/\\/g, "/");
+            const segments = normalized.split("/").filter(Boolean);
+
+            if (!segments.length) {
+              throw new Error("Path empty after normalization.");
+            }
+
+            if (segments.includes("..")) {
+              throw new Error(`Parent traversal not allowed: ${relativePath}`);
+            }
+
+            if (segments.includes(".git")) {
+              throw new Error(`.git path not allowed: ${relativePath}`);
+            }
+
+            return segments.join("/");
+          }
+
+          function walkFiles(dir) {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            const files = [];
+
+            for (const entry of entries) {
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                files.push(...walkFiles(fullPath));
+              } else if (entry.isFile()) {
+                files.push(fullPath);
+              }
+            }
+
+            return files;
+          }
+
+          if (fs.existsSync(filesRoot)) {
+            for (const sourcePath of walkFiles(filesRoot)) {
+              const relativePath = assertSafeRelativePath(path.relative(filesRoot, sourcePath));
+              const destinationPath = path.join(repoRoot, relativePath);
+              fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+              fs.copyFileSync(sourcePath, destinationPath);
+            }
+          }
+
+          if (fs.existsSync(deletesPath)) {
+            const deleteLines = fs
+              .readFileSync(deletesPath, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+
+            for (const deleteLine of deleteLines) {
+              const relativePath = assertSafeRelativePath(deleteLine);
+              const targetPath = path.join(repoRoot, relativePath);
+              fs.rmSync(targetPath, { recursive: true, force: true });
+            }
+          }
+          NODE
+
+      - name: Run Node checks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          fi
+
+          if [ -f package.json ]; then
+            npm test --if-present
+            npm run build --if-present
+            npm run lint --if-present
+          fi
+
+      - name: Cleanup patch files after successful apply
+        env:
+          ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          READY_PATH: ${{ steps.ready.outputs.ready_path }}
+        run: |
+          set -euo pipefail
+          rm -f "$ZIP_PATH" "$META_PATH" "$READY_PATH"
+
+      - name: Commit and push
+        env:
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No repo changes after apply."
+            exit 0
+          fi
+
+          git config user.name "gptrive[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(gptrive): apply patch ${PATCH_ID}"
+          git push origin "HEAD:${CHECKOUT_BRANCH}"
+
+      - name: Write error report
+        if: failure()
+        env:
+          PATCH_ID: ${{ steps.ready.outputs.patch_id }}
+          READY_PATH: ${{ steps.ready.outputs.ready_path }}
+          ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
+          META_PATH: ${{ steps.ready.outputs.meta_path }}
+          APPLY_MODE: ${{ steps.meta.outputs.apply_mode }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
+          RESOLVE_STATUS: ${{ steps.resolve.conclusion }}
+          READY_STATUS: ${{ steps.ready.conclusion }}
+          META_STATUS: ${{ steps.meta.conclusion }}
+        run: |
+          cat > error-report.md <<EOF
+          # GPTrive Error Report
+
+          - Patch ID: ${PATCH_ID:-unknown}
+          - Trigger Ref: ${GITHUB_REF}
+          - Trigger SHA: ${GITHUB_SHA}
+          - Ready Path: ${READY_PATH:-unknown}
+          - Zip Path: ${ZIP_PATH:-unknown}
+          - Meta Path: ${META_PATH:-unknown}
+          - Apply Mode: ${APPLY_MODE:-unknown}
+          - Target Branch: ${TARGET_BRANCH:-unknown}
+          - Checkout Branch: ${CHECKOUT_BRANCH:-unknown}
+          - Resolve Step: ${RESOLVE_STATUS:-unknown}
+          - Ready Step: ${READY_STATUS:-unknown}
+          - Meta Step: ${META_STATUS:-unknown}
+          - Run URL: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Failure keeps patch files in branch for debugging.
+          Inspect failed step logs in current workflow run for exact error output.
+          EOF
+
+      - name: Upload error report artifact
+        if: ${{ always() && hashFiles('error-report.md') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gptrive-error-report-${{ github.run_id }}
+          path: error-report.md
