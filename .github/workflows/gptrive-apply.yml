@@ -175,6 +175,13 @@ jobs:
           echo "current git branch=$(git branch --show-current)"
           echo "current git sha=$(git rev-parse HEAD)"
 
+      - name: Initialize runtime workspace
+        run: |
+          set -euo pipefail
+          mkdir -p .gptrive/runtime/logs
+          : > .gptrive/runtime/changed-files.txt
+          : > .gptrive/runtime/deleted-files.txt
+
       - name: Stage patch files
         env:
           ZIP_PATH: ${{ steps.ready.outputs.zip_path }}
@@ -239,6 +246,11 @@ jobs:
           const extractRoot = process.env.EXTRACT_ROOT;
           const filesRoot = path.join(extractRoot, "files");
           const deletesPath = path.join(extractRoot, "deletes.txt");
+          const runtimeRoot = path.join(repoRoot, ".gptrive", "runtime");
+          const changedFilesPath = path.join(runtimeRoot, "changed-files.txt");
+          const deletedFilesPath = path.join(runtimeRoot, "deleted-files.txt");
+          const changedFiles = [];
+          const deletedFiles = [];
 
           function assertSafeRelativePath(relativePath) {
             if (!relativePath || typeof relativePath !== "string") {
@@ -289,6 +301,7 @@ jobs:
               const destinationPath = path.join(repoRoot, relativePath);
               fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
               fs.copyFileSync(sourcePath, destinationPath);
+              changedFiles.push(relativePath);
             }
           }
 
@@ -303,25 +316,81 @@ jobs:
               const relativePath = assertSafeRelativePath(deleteLine);
               const targetPath = path.join(repoRoot, relativePath);
               fs.rmSync(targetPath, { recursive: true, force: true });
+              deletedFiles.push(relativePath);
             }
           }
+
+          fs.writeFileSync(changedFilesPath, changedFiles.join("\n"));
+          fs.writeFileSync(deletedFilesPath, deletedFiles.join("\n"));
           NODE
 
       - name: Run Node checks
         shell: bash
         run: |
           set -euo pipefail
+          RUNTIME_DIR=".gptrive/runtime"
+          LOG_DIR="$RUNTIME_DIR/logs"
+          mkdir -p "$LOG_DIR"
+
+          summarize_log() {
+            python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); lines=p.read_text(errors="replace").splitlines() if p.exists() else []; tail=[line.strip() for line in lines[-80:] if line.strip()]; patterns=("intentional test failure","npm ERR!","error:","Error:","failed","FAILED"); primary=next((line for line in tail if any(pattern in line for pattern in patterns) and not line.startswith("> ")), ""); secondary=next((line for line in tail if any(pattern in line for pattern in patterns)), ""); fallback=next((line for line in reversed(tail) if line), "No output captured." if p.exists() else "No log captured."); print(primary or secondary or fallback)' "$1"
+          }
+
+          record_skip() {
+            local name="$1"
+            local reason="$2"
+            printf '%s\n' "$reason" > "$LOG_DIR/$name.log"
+            printf 'SKIPPED\n' > "$RUNTIME_DIR/$name.exit_code.txt"
+            printf '%s\n' "$reason" > "$RUNTIME_DIR/$name.summary.txt"
+            : > "$RUNTIME_DIR/$name.tail.txt"
+          }
+
+          run_check() {
+            local name="$1"
+            shift
+            local cmd="$*"
+            local log_path="$LOG_DIR/$name.log"
+            local exit_code
+            local summary
+
+            printf '%s\n' "$cmd" > "$RUNTIME_DIR/$name.command.txt"
+
+            set +e
+            bash -lc "$cmd" >"$log_path" 2>&1
+            exit_code=$?
+            set -e
+
+            printf '%s\n' "$exit_code" > "$RUNTIME_DIR/$name.exit_code.txt"
+            tail -n 80 "$log_path" > "$RUNTIME_DIR/$name.tail.txt" || true
+            summary="$(summarize_log "$log_path")"
+            printf '%s\n' "$summary" > "$RUNTIME_DIR/$name.summary.txt"
+
+            if [ "$exit_code" -ne 0 ]; then
+              printf '%s\n' "$name" > "$RUNTIME_DIR/failed-check.txt"
+              printf '%s\n' "$cmd" > "$RUNTIME_DIR/failed-command.txt"
+              printf '%s\n' "$exit_code" > "$RUNTIME_DIR/failed-exit-code.txt"
+              printf '%s\n' "$summary" > "$RUNTIME_DIR/error-summary.txt"
+              cp "$RUNTIME_DIR/$name.tail.txt" "$RUNTIME_DIR/failed-output-tail.txt"
+              return "$exit_code"
+            fi
+          }
 
           if [ -f package-lock.json ]; then
-            npm ci
+            run_check install "npm ci"
           elif [ -f package.json ]; then
-            npm install
+            run_check install "npm install"
+          else
+            record_skip install "Skipped install: no package.json or package-lock.json."
           fi
 
           if [ -f package.json ]; then
-            npm test --if-present
-            npm run build --if-present
-            npm run lint --if-present
+            run_check test "npm test --if-present"
+            run_check build "npm run build --if-present"
+            run_check lint "npm run lint --if-present"
+          else
+            record_skip test "Skipped test: no package.json."
+            record_skip build "Skipped build: no package.json."
+            record_skip lint "Skipped lint: no package.json."
           fi
 
       - name: Cleanup patch files after successful apply
@@ -339,6 +408,7 @@ jobs:
           CHECKOUT_BRANCH: ${{ steps.meta.outputs.checkout_branch }}
         run: |
           set -euo pipefail
+          CHANGED_FILES="$(cat .gptrive/runtime/changed-files.txt 2>/dev/null || true)"
 
           if [ -z "$(git status --porcelain)" ]; then
             echo "No repo changes after apply."
@@ -347,9 +417,27 @@ jobs:
 
           git config user.name "gptrive[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf .gptrive/runtime
           git add -A
           git commit -m "chore(gptrive): apply patch ${PATCH_ID}"
           git push origin "HEAD:${CHECKOUT_BRANCH}"
+
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          {
+            echo "## GPTrive Success"
+            echo
+            echo "- Patch ID: ${PATCH_ID}"
+            echo "- Changed Files:"
+            if [ -n "$CHANGED_FILES" ]; then
+              while IFS= read -r line; do
+                [ -n "$line" ] && echo "  - ${line}"
+              done <<< "$CHANGED_FILES"
+            else
+              echo "  - none"
+            fi
+            echo "- Commit SHA: ${COMMIT_SHA}"
+            echo "- Cleanup Status: removed .gptrive/runtime and patch bundle files before commit"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Write error report
         if: failure()
@@ -365,26 +453,99 @@ jobs:
           READY_STATUS: ${{ steps.ready.conclusion }}
           META_STATUS: ${{ steps.meta.conclusion }}
         run: |
-          cat > error-report.md <<EOF
-          # GPTrive Error Report
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
 
-          - Patch ID: ${PATCH_ID:-unknown}
-          - Trigger Ref: ${GITHUB_REF}
-          - Trigger SHA: ${GITHUB_SHA}
-          - Ready Path: ${READY_PATH:-unknown}
-          - Zip Path: ${ZIP_PATH:-unknown}
-          - Meta Path: ${META_PATH:-unknown}
-          - Apply Mode: ${APPLY_MODE:-unknown}
-          - Target Branch: ${TARGET_BRANCH:-unknown}
-          - Checkout Branch: ${CHECKOUT_BRANCH:-unknown}
-          - Resolve Step: ${RESOLVE_STATUS:-unknown}
-          - Ready Step: ${READY_STATUS:-unknown}
-          - Meta Step: ${META_STATUS:-unknown}
-          - Run URL: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          const runtimeDir = path.join(process.cwd(), ".gptrive", "runtime");
+          const runUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const artifactName = `gptrive-error-report-${process.env.GITHUB_RUN_ID}`;
 
-          Failure keeps patch files in branch for debugging.
-          Inspect failed step logs in current workflow run for exact error output.
-          EOF
+          function readOptional(relativePath, fallback = "unknown") {
+            const fullPath = path.join(runtimeDir, relativePath);
+            if (!fs.existsSync(fullPath)) {
+              return fallback;
+            }
+            const value = fs.readFileSync(fullPath, "utf8").trim();
+            return value || fallback;
+          }
+
+          function readList(relativePath) {
+            const fullPath = path.join(runtimeDir, relativePath);
+            if (!fs.existsSync(fullPath)) {
+              return [];
+            }
+            return fs
+              .readFileSync(fullPath, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+          }
+
+          const changedFiles = readList("changed-files.txt");
+          const deletedFiles = readList("deleted-files.txt");
+          const failedCommand = readOptional("failed-command.txt");
+          const failedExitCode = readOptional("failed-exit-code.txt");
+          const errorSummary = readOptional("error-summary.txt");
+          const rawOutputTail = readOptional("failed-output-tail.txt", "No output tail captured.");
+
+          const report = [
+            "# GPTrive Error Report",
+            "",
+            `- Patch ID: ${process.env.PATCH_ID || "unknown"}`,
+            `- Apply Mode: ${process.env.APPLY_MODE || "unknown"}`,
+            `- Target Branch: ${process.env.TARGET_BRANCH || "unknown"}`,
+            `- Zip Path: ${process.env.ZIP_PATH || "unknown"}`,
+            `- Meta Path: ${process.env.META_PATH || "unknown"}`,
+            `- Ready Path: ${process.env.READY_PATH || "unknown"}`,
+            `- Trigger Ref: ${process.env.GITHUB_REF || "unknown"}`,
+            `- Trigger SHA: ${process.env.GITHUB_SHA || "unknown"}`,
+            `- Checkout Branch: ${process.env.CHECKOUT_BRANCH || "unknown"}`,
+            `- Resolve Step: ${process.env.RESOLVE_STATUS || "unknown"}`,
+            `- Ready Step: ${process.env.READY_STATUS || "unknown"}`,
+            `- Meta Step: ${process.env.META_STATUS || "unknown"}`,
+            `- Failed Command: ${failedCommand}`,
+            `- Exit Code: ${failedExitCode}`,
+            `- Error Summary: ${errorSummary}`,
+            `- Workflow Run URL: ${runUrl}`,
+            "",
+            "## Changed Files",
+            changedFiles.length ? changedFiles.map((line) => `- ${line}`).join("\n") : "- none",
+            "",
+            "## Deleted Files",
+            deletedFiles.length ? deletedFiles.map((line) => `- ${line}`).join("\n") : "- none",
+            "",
+            "## Raw Output Tail",
+            "```text",
+            rawOutputTail,
+            "```",
+            "",
+            "## Request for ChatGPT",
+            "请基于以上 GPTrive error-report 修复项目，并重新生成 gptrive.zip。zip 格式仍然是：",
+            "- gptrive.json",
+            "- files/",
+            "- deletes.txt",
+            ""
+          ].join("\n");
+
+          fs.writeFileSync("error-report.md", report);
+
+          const summary = [
+            "## GPTrive Failure",
+            "",
+            `- Patch ID: ${process.env.PATCH_ID || "unknown"}`,
+            `- Apply Mode: ${process.env.APPLY_MODE || "unknown"}`,
+            `- Target Branch: ${process.env.TARGET_BRANCH || "unknown"}`,
+            "- Changed Files:",
+            ...(changedFiles.length ? changedFiles.map((line) => `  - ${line}`) : ["  - none"]),
+            `- Failed Command: ${failedCommand}`,
+            `- Error Summary: ${errorSummary}`,
+            `- Artifact Name: ${artifactName}`,
+            ""
+          ].join("\n");
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`);
+          NODE
 
       - name: Upload error report artifact
         if: ${{ always() && hashFiles('error-report.md') != '' }}
