@@ -511,133 +511,140 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
 
-          const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
-          const apiBase = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
-          const changedFiles = fs
-            .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-summary/changed-files.txt`, "utf8")
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean);
-          const deletedFiles = fs
-            .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-summary/deleted-files.txt`, "utf8")
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean);
+          async function main() {
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+            const apiBase = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+            const changedFiles = fs
+              .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-summary/changed-files.txt`, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            const deletedFiles = fs
+              .readFileSync(`${process.env.RUNNER_TEMP}/gptrive-summary/deleted-files.txt`, "utf8")
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
 
-          async function github(method, path, body) {
-            const response = await fetch(`${apiBase}${path}`, {
-              method,
-              headers: {
-                Accept: "application/vnd.github+json",
-                Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": "2022-11-28"
-              },
-              body: body ? JSON.stringify(body) : undefined
-            });
+            async function github(method, path, body) {
+              const response = await fetch(`${apiBase}${path}`, {
+                method,
+                headers: {
+                  Accept: "application/vnd.github+json",
+                  Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28"
+                },
+                body: body ? JSON.stringify(body) : undefined
+              });
 
-            const text = await response.text();
-            const data = text ? JSON.parse(text) : null;
+              const text = await response.text();
+              const data = text ? JSON.parse(text) : null;
 
-            if (!response.ok) {
-              throw new Error(data?.message || `${method} ${path} failed with ${response.status}`);
+              if (!response.ok) {
+                throw new Error(data?.message || `${method} ${path} failed with ${response.status}`);
+              }
+
+              return data;
             }
 
-            return data;
-          }
-
-          function recordFailure(message) {
-            fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-check.txt`, "pr");
-            fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-command.txt`, "create pull request");
-            fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-exit-code.txt`, "1");
-            fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/error-summary.txt`, message);
-            fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-output-tail.txt`, message);
-          }
-
-          function renderList(lines) {
-            return lines.length ? lines.map((line) => `- ${line}`).join("\n") : "- none";
-          }
-
-          function buildBody() {
-            const parts = [
-              "## GPTrive Patch",
-              "",
-              `Patch ID: \`${process.env.PATCH_ID}\``,
-              "",
-              `Target branch: \`${process.env.TARGET_BRANCH}\``,
-              "",
-              "Apply mode: `pr`"
-            ];
-
-            if ((process.env.PR_DESCRIPTION || "").trim()) {
-              parts.push("", "## Summary", "", process.env.PR_DESCRIPTION.trim());
+            function recordFailure(message) {
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-check.txt`, "pr");
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-command.txt`, "create pull request");
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-exit-code.txt`, "1");
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/error-summary.txt`, message);
+              fs.writeFileSync(`${process.env.RUNTIME_SNAPSHOT_DIR}/failed-output-tail.txt`, message);
             }
 
-            parts.push(
-              "",
-              "## Changed files",
-              "",
-              renderList(changedFiles),
-              "",
-              "## Deleted files",
-              "",
-              renderList(deletedFiles),
-              "",
-              "## Checks",
-              "",
-              "GitHub Actions checks passed before this PR was created.",
-              "",
-              "## Next step",
-              "",
-              "Review this PR and merge it in GitHub if the changes look correct."
-            );
+            function renderList(lines) {
+              return lines.length ? lines.map((line) => `- ${line}`).join("\n") : "- none";
+            }
 
-            return parts.join("\n");
-          }
+            function buildBody() {
+              const parts = [
+                "## GPTrive Patch",
+                "",
+                `Patch ID: \`${process.env.PATCH_ID}\``,
+                "",
+                `Target branch: \`${process.env.TARGET_BRANCH}\``,
+                "",
+                "Apply mode: `pr`"
+              ];
 
-          const outputPath = process.env.GITHUB_OUTPUT;
+              if ((process.env.PR_DESCRIPTION || "").trim()) {
+                parts.push("", "## Summary", "", process.env.PR_DESCRIPTION.trim());
+              }
 
-          try {
-            const query = new URLSearchParams({
-              state: "open",
-              head: `${owner}:${process.env.PR_BRANCH}`,
-              base: process.env.TARGET_BRANCH,
-              per_page: "20"
-            });
-            const existing = await github("GET", `/pulls?${query.toString()}`);
+              parts.push(
+                "",
+                "## Changed files",
+                "",
+                renderList(changedFiles),
+                "",
+                "## Deleted files",
+                "",
+                renderList(deletedFiles),
+                "",
+                "## Checks",
+                "",
+                "GitHub Actions checks passed before this PR was created.",
+                "",
+                "## Next step",
+                "",
+                "Review this PR and merge it in GitHub if the changes look correct."
+              );
 
-            if (Array.isArray(existing) && existing.length) {
-              const pr = existing[0];
+              return parts.join("\n");
+            }
+
+            const outputPath = process.env.GITHUB_OUTPUT;
+
+            try {
+              const query = new URLSearchParams({
+                state: "open",
+                head: `${owner}:${process.env.PR_BRANCH}`,
+                base: process.env.TARGET_BRANCH,
+                per_page: "20"
+              });
+              const existing = await github("GET", `/pulls?${query.toString()}`);
+
+              if (Array.isArray(existing) && existing.length) {
+                const pr = existing[0];
+                fs.appendFileSync(
+                  outputPath,
+                  [
+                    `pr_url=${pr.html_url || ""}`,
+                    `pr_number=${pr.number || ""}`,
+                    "pr_status=existing"
+                  ].join("\n") + "\n"
+                );
+                return;
+              }
+
+              const created = await github("POST", "/pulls", {
+                title: process.env.PR_TITLE || `GPTrive: ${process.env.PATCH_ID}`,
+                body: buildBody(),
+                head: process.env.PR_BRANCH,
+                base: process.env.TARGET_BRANCH
+              });
+
               fs.appendFileSync(
                 outputPath,
                 [
-                  `pr_url=${pr.html_url || ""}`,
-                  `pr_number=${pr.number || ""}`,
-                  "pr_status=existing"
+                  `pr_url=${created.html_url || ""}`,
+                  `pr_number=${created.number || ""}`,
+                  "pr_status=created"
                 ].join("\n") + "\n"
               );
-              return;
+            } catch (error) {
+              recordFailure(String(error.message || error));
+              throw error;
             }
-
-            const created = await github("POST", "/pulls", {
-              title: process.env.PR_TITLE || `GPTrive: ${process.env.PATCH_ID}`,
-              body: buildBody(),
-              head: process.env.PR_BRANCH,
-              base: process.env.TARGET_BRANCH
-            });
-
-            fs.appendFileSync(
-              outputPath,
-              [
-                `pr_url=${created.html_url || ""}`,
-                `pr_number=${created.number || ""}`,
-                "pr_status=created"
-              ].join("\n") + "\n"
-            );
-          } catch (error) {
-            recordFailure(String(error.message || error));
-            throw error;
           }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
           NODE
 
       - name: Write success summary
