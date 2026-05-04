@@ -1,0 +1,9 @@
+{
+  "id": "gptrive-20260504-162022-7195",
+  "originalName": "gptrive.zip",
+  "title": "GPTrive patch",
+  "applyMode": "pr",
+  "targetBranch": "main",
+  "createdAt": "2026-05-04T08:20:22.259Z",
+  "prBranch": "gptrive/gptrive-20260504-162022-7195"
+}
